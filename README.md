@@ -48,7 +48,8 @@ The FlightRadar firmware offers the following features:
 - Display GPS location, registration, altitude, heading, speed and vertical speed of the airplane
 - Lookup of the full name for the from- and to airports name and region, lat/lon
 - Lookup and display flag for the countries
-- No account required, ony WiFi with internet connection!
+- **GPS Module Support**: Real-time GPS location and time updates using Adafruit Mini GPS PA1010D module
+- No account required, only WiFi with internet connection!
 - Minimal interaction with FlightRadar24; database and graphics are present in firmware
 - Configuration using a Web interface
 - HTML status screen
@@ -63,6 +64,23 @@ After configuration the device starts updating the flights in the configured are
 
 When pressing the top button, the device switches to clock mode: just showing the date and time.
 To return to the flights mode, press the top button again.
+
+## GPS Hardware Setup
+
+To enable GPS functionality, connect an Adafruit Mini GPS PA1010D module to the LilyGo T-Display S3:
+
+- **SDA Pin**: Connect to GPIO 43
+- **SCL Pin**: Connect to GPIO 44
+- **VCC**: Connect to 3.3V
+- **GND**: Connect to ground
+
+The GPS module will automatically:
+- Update location data every minute
+- Display GPS time when no flights are available
+- Show satellite count and fix status
+- Provide real-time coordinates for location-based flight tracking
+
+GPS data is also available in the web interface status page.
 
 ## Installing and running PlatformIO
 
