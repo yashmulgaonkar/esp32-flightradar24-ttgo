@@ -79,8 +79,17 @@ The GPS module will automatically:
 - Display GPS time when no flights are available
 - Show satellite count and fix status
 - Provide real-time coordinates for location-based flight tracking
+- **Fallback to user-configured location** when GPS is not connected or has no fix
 
 GPS data is also available in the web interface status page.
+
+**Important**: If the GPS module is not connected or cannot get a satellite fix, the system will automatically use the location coordinates configured through the web interface. This ensures the device continues to function even without GPS.
+
+**GPS Status Indicators**:
+- **Green "GPS Active"**: GPS module is connected and has a satellite fix
+- **Blue "User Config"**: Using user-configured location (GPS not connected or no fix)
+- **Red "GPS: Not Connected"**: GPS module is not detected on I2C
+- **Orange "GPS: No Fix"**: GPS module is connected but no satellite fix
 
 ## Installing and running PlatformIO
 
