@@ -64,6 +64,7 @@ std::list<flight_info>::const_iterator it = flights.cbegin();
 Adafruit_GPS GPS(&Wire);
 unsigned long last_gps_update = 0;
 const unsigned long GPS_UPDATE_INTERVAL = 60000; // Update every minute
+bool gps_connected = false;
 bool gps_fix = false;
 float gps_latitude = 0.0;
 float gps_longitude = 0.0;
@@ -145,6 +146,26 @@ void update_gps_data()
   }
 }
 
+// Function to get current location (GPS if available, otherwise user-configured)
+void get_current_location(float &latitude, float &longitude, bool &is_gps_source)
+{
+  if (gps_connected && gps_fix) {
+    latitude = gps_latitude;
+    longitude = gps_longitude;
+    is_gps_source = true;
+    log_d("Using GPS location: Lat=%.6f, Lon=%.6f", latitude, longitude);
+  } else {
+    latitude = iotWebParamLatitude.value();
+    longitude = iotWebParamLongitude.value();
+    is_gps_source = false;
+    if (!gps_connected) {
+      log_d("GPS not connected, using user-configured location: Lat=%.6f, Lon=%.6f", latitude, longitude);
+    } else {
+      log_d("No GPS fix, using user-configured location: Lat=%.6f, Lon=%.6f", latitude, longitude);
+    }
+  }
+}
+
 void update_runtime_config()
 {
   log_v("update_runtime_config");
@@ -206,12 +227,18 @@ void handleRoot()
       {"MaxAllocHeap", format_memory(ESP.getMaxAllocHeap())},
       {"LocalTime", get_localtime("%F - %T")},
       // GPS Data
+      {"GpsConnected", gps_connected ? "Yes" : "No"},
       {"GpsFix", gps_fix ? "Yes" : "No"},
       {"GpsTime", gps_fix ? gps_time : "No GPS"},
       {"GpsLatitude", gps_fix ? String(gps_latitude, 6) : "N/A"},
       {"GpsLongitude", gps_fix ? String(gps_longitude, 6) : "N/A"},
       {"GpsSatellites", gps_fix ? String(GPS.satellites) : "N/A"},
       {"GpsLocation", gps_fix ? format_gps_location(gps_latitude, gps_longitude) : "No GPS Fix"},
+      // Current Location Source
+      {"LocationSource", (gps_connected && gps_fix) ? "GPS Active" : "User Configuration"},
+      {"CurrentLatitude", (gps_connected && gps_fix) ? String(gps_latitude, 6) : String(iotWebParamLatitude.value(), 6)},
+      {"CurrentLongitude", (gps_connected && gps_fix) ? String(gps_longitude, 6) : String(iotWebParamLongitude.value(), 6)},
+      {"CurrentLocation", (gps_connected && gps_fix) ? format_gps_location(gps_latitude, gps_longitude) : format_gps_location(iotWebParamLatitude.value(), iotWebParamLongitude.value())},
       // Network
       {"HostName", hostname},
       {"MacAddress", WiFi.macAddress()},
@@ -300,8 +327,10 @@ void setup()
     GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
     GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
     GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
+    gps_connected = true;
     log_i("GPS module initialized on I2C pins 43, 44");
   } else {
+    gps_connected = false;
     log_e("Failed to initialize GPS module on I2C address 0x10");
   }
 
@@ -646,8 +675,14 @@ void display_flights()
     if (it == flights.cend())
     {
       log_i("Updating flights");
+      
+      // Get current location (GPS or user-configured)
+      float current_lat, current_lon;
+      bool using_gps;
+      get_current_location(current_lat, current_lon, using_gps);
+      
       String error_message;
-      if (!get_flights(iotWebParamLatitude.value(), iotWebParamLongitude.value(), iotWebParamLatitudeRange.value(), iotWebParamLongitudeRange.value(), iotWebParamAirborne.value(), iotWebParamGrounded.value(), iotWebParamGliders.value(), iotWebParamVehicles.value(), flights, error_message))
+      if (!get_flights(current_lat, current_lon, iotWebParamLatitudeRange.value(), iotWebParamLongitudeRange.value(), iotWebParamAirborne.value(), iotWebParamGrounded.value(), iotWebParamGliders.value(), iotWebParamVehicles.value(), flights, error_message))
       {
         log_e("Error getting flights: %s", error_message.c_str());
         auto label_message = lv_label_create(lv_scr_act());
@@ -669,42 +704,53 @@ void display_flights()
         lv_obj_set_style_text_font(label_message, &lv_font_montserrat_22, LV_STATE_DEFAULT);
         lv_obj_align(label_message, LV_ALIGN_TOP_MID, 0, 0);
         
-        // Display GPS data if available
-        if (gps_fix) {
+        // Get current location for display
+        float display_lat, display_lon;
+        bool using_gps_for_display;
+        get_current_location(display_lat, display_lon, using_gps_for_display);
+        
+        // Display current time
+        auto label_time = lv_label_create(lv_scr_act());
+        lv_label_set_text(label_time, get_localtime("%F - %R").c_str());
+        lv_obj_align(label_time, LV_ALIGN_CENTER, 0, -20);
+        
+        // Display current location
+        auto label_latlon = lv_label_create(lv_scr_act());
+        lv_label_set_text(label_latlon, format_gps_location(display_lat, display_lon).c_str());
+        lv_obj_align(label_latlon, LV_ALIGN_CENTER, 0, 0);
+        
+        // Display location source
+        auto label_source = lv_label_create(lv_scr_act());
+        if (using_gps_for_display) {
+          lv_label_set_text(label_source, "GPS Active");
+          lv_obj_set_style_text_color(label_source, lv_palette_main(LV_PALETTE_GREEN), LV_STATE_DEFAULT);
+          
+          // Show GPS time and satellite count
           auto label_gps_time = lv_label_create(lv_scr_act());
           lv_label_set_text(label_gps_time, ("GPS: " + gps_time).c_str());
-          lv_obj_align(label_gps_time, LV_ALIGN_CENTER, 0, -20);
+          lv_obj_align(label_gps_time, LV_ALIGN_CENTER, 0, 20);
           
-          auto label_gps_latlon = lv_label_create(lv_scr_act());
-          lv_label_set_text(label_gps_latlon, format_gps_location(gps_latitude, gps_longitude).c_str());
-          lv_obj_align(label_gps_latlon, LV_ALIGN_CENTER, 0, 0);
-          
-          auto label_gps_status = lv_label_create(lv_scr_act());
-          lv_label_set_text(label_gps_status, "GPS Fix Active");
-          lv_obj_set_style_text_color(label_gps_status, lv_palette_main(LV_PALETTE_GREEN), LV_STATE_DEFAULT);
-          lv_obj_align(label_gps_status, LV_ALIGN_CENTER, 0, 20);
-          
-          // Show satellite count if available
           if (GPS.satellites > 0) {
             auto label_satellites = lv_label_create(lv_scr_act());
             lv_label_set_text(label_satellites, ("Sats: " + String(GPS.satellites)).c_str());
             lv_obj_align(label_satellites, LV_ALIGN_CENTER, 0, 40);
           }
         } else {
-          auto label_time = lv_label_create(lv_scr_act());
-          lv_label_set_text(label_time, get_localtime("%F - %R").c_str());
-          lv_obj_align(label_time, LV_ALIGN_CENTER, 0, 0);
+          lv_label_set_text(label_source, "User Config");
+          lv_obj_set_style_text_color(label_source, lv_palette_main(LV_PALETTE_BLUE), LV_STATE_DEFAULT);
           
-          auto label_latlon = lv_label_create(lv_scr_act());
-          lv_label_set_text(label_latlon, format_gps_location(iotWebParamLatitude.value(), iotWebParamLongitude.value()).c_str());
-          lv_obj_align(label_latlon, LV_ALIGN_CENTER, 0, 16);
-          
-          // Show GPS status when no fix
+          // Show GPS status based on connection and fix
           auto label_gps_status = lv_label_create(lv_scr_act());
-          lv_label_set_text(label_gps_status, "GPS: No Fix");
-          lv_obj_set_style_text_color(label_gps_status, lv_palette_main(LV_PALETTE_ORANGE), LV_STATE_DEFAULT);
-          lv_obj_align(label_gps_status, LV_ALIGN_CENTER, 0, 40);
+          if (!gps_connected) {
+            lv_label_set_text(label_gps_status, "GPS: Not Connected");
+            lv_obj_set_style_text_color(label_gps_status, lv_palette_main(LV_PALETTE_RED), LV_STATE_DEFAULT);
+          } else {
+            lv_label_set_text(label_gps_status, "GPS: No Fix");
+            lv_obj_set_style_text_color(label_gps_status, lv_palette_main(LV_PALETTE_ORANGE), LV_STATE_DEFAULT);
+          }
+          lv_obj_align(label_gps_status, LV_ALIGN_CENTER, 0, 20);
         }
+        lv_obj_align(label_source, LV_ALIGN_CENTER, 0, -40);
         
         auto label_location = lv_label_create(lv_scr_act());
         lv_label_set_text(label_location, iotWebParamLocation.value());
