@@ -2,6 +2,7 @@
 
 #include <SPI.h>
 #include <soc/rtc_cntl_reg.h>
+#include <Wire.h>
 
 // Settings for the display are defined in platformio.ini
 #include <TFT_eSPI.h>
@@ -21,6 +22,9 @@
 
 #include <images.h>
 #include <timezonedb_lookup.h>
+
+// GPS library
+#include <Adafruit_GPS.h>
 
 // Embedded data
 extern const uint8_t binary_html_bootstrap_min_css_gz_start[] asm("_binary_html_bootstrap_min_css_gz_start");
@@ -56,6 +60,15 @@ std::list<flight_info> flights;
 // Flight to display
 std::list<flight_info>::const_iterator it = flights.cbegin();
 
+// GPS variables
+Adafruit_GPS GPS(&Wire);
+unsigned long last_gps_update = 0;
+const unsigned long GPS_UPDATE_INTERVAL = 60000; // Update every minute
+bool gps_fix = false;
+float gps_latitude = 0.0;
+float gps_longitude = 0.0;
+String gps_time = "";
+
 void send_content_gzip(const unsigned char *content, size_t length, const char *mime_type)
 {
   server.sendHeader("Content-encoding", "gzip");
@@ -81,6 +94,55 @@ String get_localtime(const char *format)
   char time_buffer[32];
   strftime(time_buffer, sizeof(time_buffer), format, &timeinfo);
   return time_buffer;
+}
+
+void update_gps_data()
+{
+  unsigned long current_time = millis();
+  
+  // Check if it's time to update GPS data
+  if (current_time - last_gps_update >= GPS_UPDATE_INTERVAL) {
+    log_i("Updating GPS data...");
+    
+    // Read GPS data
+    GPS.read();
+    
+    // Check if we have a fix
+    if (GPS.fix) {
+      gps_fix = true;
+      gps_latitude = GPS.latitudeDegrees;
+      gps_longitude = GPS.longitudeDegrees;
+      
+      // Format GPS time
+      char time_buffer[32];
+      snprintf(time_buffer, sizeof(time_buffer), "%02d:%02d:%02d", 
+               GPS.hour, GPS.minute, GPS.seconds);
+      gps_time = String(time_buffer);
+      
+      log_i("GPS Fix: Lat=%.6f, Lon=%.6f, Time=%s", 
+            gps_latitude, gps_longitude, gps_time.c_str());
+      
+      // Update location settings with GPS data if this is the first fix
+      static bool first_gps_fix = true;
+      if (first_gps_fix) {
+        log_i("First GPS fix - updating location settings");
+        // Note: In a real implementation, you might want to save these to EEPROM
+        // For now, we'll just log the values
+        log_i("GPS Location: Lat=%.6f, Lon=%.6f", gps_latitude, gps_longitude);
+        first_gps_fix = false;
+      }
+    } else {
+      gps_fix = false;
+      log_w("No GPS fix available");
+    }
+    
+    last_gps_update = current_time;
+  }
+  
+  // Also read GPS data continuously for better responsiveness
+  if (GPS.newNMEAreceived()) {
+    GPS.parse(GPS.lastNMEA());
+  }
 }
 
 void update_runtime_config()
@@ -143,6 +205,13 @@ void handleRoot()
       {"FreeHeap", format_memory(ESP.getFreeHeap())},
       {"MaxAllocHeap", format_memory(ESP.getMaxAllocHeap())},
       {"LocalTime", get_localtime("%F - %T")},
+      // GPS Data
+      {"GpsFix", gps_fix ? "Yes" : "No"},
+      {"GpsTime", gps_fix ? gps_time : "No GPS"},
+      {"GpsLatitude", gps_fix ? String(gps_latitude, 6) : "N/A"},
+      {"GpsLongitude", gps_fix ? String(gps_longitude, 6) : "N/A"},
+      {"GpsSatellites", gps_fix ? String(GPS.satellites) : "N/A"},
+      {"GpsLocation", gps_fix ? format_gps_location(gps_latitude, gps_longitude) : "No GPS Fix"},
       // Network
       {"HostName", hostname},
       {"MacAddress", WiFi.macAddress()},
@@ -221,6 +290,20 @@ void setup()
   log_i("CPU Freq = %d Mhz", getCpuFrequencyMhz());
   log_i("Free heap: %d bytes", ESP.getFreeHeap());
   log_i("Starting " APP_TITLE "...");
+
+  // Initialize I2C for GPS
+  Wire.begin(43, 44); // SDA=43, SCL=44
+  Wire.setClock(400000); // 400kHz I2C clock
+  
+  // Initialize GPS
+  if (GPS.begin(0x10)) { // PA1010D I2C address
+    GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+    GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+    GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
+    log_i("GPS module initialized on I2C pins 43, 44");
+  } else {
+    log_e("Failed to initialize GPS module on I2C address 0x10");
+  }
 
   // Input buttons
   pinMode(GPIO_BUTTON_TOP, INPUT_PULLUP);
@@ -585,12 +668,44 @@ void display_flights()
         lv_obj_set_style_text_color(label_message, lv_palette_main(LV_PALETTE_RED), LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(label_message, &lv_font_montserrat_22, LV_STATE_DEFAULT);
         lv_obj_align(label_message, LV_ALIGN_TOP_MID, 0, 0);
-        auto label_time = lv_label_create(lv_scr_act());
-        lv_label_set_text(label_time, get_localtime("%F - %R").c_str());
-        lv_obj_align(label_time, LV_ALIGN_CENTER, 0, 0);
-        auto label_latlon = lv_label_create(lv_scr_act());
-        lv_label_set_text(label_latlon, format_gps_location(iotWebParamLatitude.value(), iotWebParamLongitude.value()).c_str());
-        lv_obj_align(label_latlon, LV_ALIGN_CENTER, 0, 16);
+        
+        // Display GPS data if available
+        if (gps_fix) {
+          auto label_gps_time = lv_label_create(lv_scr_act());
+          lv_label_set_text(label_gps_time, ("GPS: " + gps_time).c_str());
+          lv_obj_align(label_gps_time, LV_ALIGN_CENTER, 0, -20);
+          
+          auto label_gps_latlon = lv_label_create(lv_scr_act());
+          lv_label_set_text(label_gps_latlon, format_gps_location(gps_latitude, gps_longitude).c_str());
+          lv_obj_align(label_gps_latlon, LV_ALIGN_CENTER, 0, 0);
+          
+          auto label_gps_status = lv_label_create(lv_scr_act());
+          lv_label_set_text(label_gps_status, "GPS Fix Active");
+          lv_obj_set_style_text_color(label_gps_status, lv_palette_main(LV_PALETTE_GREEN), LV_STATE_DEFAULT);
+          lv_obj_align(label_gps_status, LV_ALIGN_CENTER, 0, 20);
+          
+          // Show satellite count if available
+          if (GPS.satellites > 0) {
+            auto label_satellites = lv_label_create(lv_scr_act());
+            lv_label_set_text(label_satellites, ("Sats: " + String(GPS.satellites)).c_str());
+            lv_obj_align(label_satellites, LV_ALIGN_CENTER, 0, 40);
+          }
+        } else {
+          auto label_time = lv_label_create(lv_scr_act());
+          lv_label_set_text(label_time, get_localtime("%F - %R").c_str());
+          lv_obj_align(label_time, LV_ALIGN_CENTER, 0, 0);
+          
+          auto label_latlon = lv_label_create(lv_scr_act());
+          lv_label_set_text(label_latlon, format_gps_location(iotWebParamLatitude.value(), iotWebParamLongitude.value()).c_str());
+          lv_obj_align(label_latlon, LV_ALIGN_CENTER, 0, 16);
+          
+          // Show GPS status when no fix
+          auto label_gps_status = lv_label_create(lv_scr_act());
+          lv_label_set_text(label_gps_status, "GPS: No Fix");
+          lv_obj_set_style_text_color(label_gps_status, lv_palette_main(LV_PALETTE_ORANGE), LV_STATE_DEFAULT);
+          lv_obj_align(label_gps_status, LV_ALIGN_CENTER, 0, 40);
+        }
+        
         auto label_location = lv_label_create(lv_scr_act());
         lv_label_set_text(label_location, iotWebParamLocation.value());
         lv_obj_align(label_location, LV_ALIGN_BOTTOM_MID, 0, -16);
@@ -618,6 +733,9 @@ void loop()
 
   // Web configuration
   iotWebConf.doLoop();
+
+  // Update GPS data every minute
+  update_gps_data();
 
   static auto last_network_state = iotwebconf::NetworkState::Boot;
 
