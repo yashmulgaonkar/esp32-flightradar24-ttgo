@@ -5,7 +5,8 @@
 #include <Wire.h>
 
 // Settings for the display are defined in platformio.ini
-#include <TFT_eSPI.h>
+#include <Arduino_GFX_Library.h>
+
 #include <lvgl.h>
 
 #include <flight_info.h>
@@ -23,16 +24,27 @@
 #include <images.h>
 #include <timezonedb_lookup.h>
 
-// GPS library
-#include <Adafruit_GPS.h>
 
 // Embedded data
 extern const uint8_t binary_html_bootstrap_min_css_gz_start[] asm("_binary_html_bootstrap_min_css_gz_start");
 extern const uint8_t binary_html_bootstrap_min_css_gz_end[] asm("_binary_html_bootstrap_min_css_gz_end");
 extern const char text_html_index_html[] asm("_binary_html_index_html_start");
 
-// LCD display
-auto tft = TFT_eSPI(TFT_WIDTH, TFT_HEIGHT);
+// LCD display - Arduino_RGB_Display for T-Panel S3 ST7701
+Arduino_DataBus *bus = new Arduino_XL9535SWSPI(IIC_SDA /* SDA */, IIC_SCL /* SCL */, -1 /* XL PWD */,
+                                               XL95X5_CS /* XL CS */, XL95X5_SCLK /* XL SCK */, XL95X5_MOSI /* XL MOSI */);
+Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
+    -1 /* DE */, TFT_VSYNC /* VSYNC */, TFT_HSYNC /* HSYNC */, TFT_PCLK /* PCLK */,
+    TFT_B0 /* B0 */, TFT_B1 /* B1 */, TFT_B2 /* B2 */, TFT_B3 /* B3 */, TFT_B4 /* B4 */,
+    TFT_G0 /* G0 */, TFT_G1 /* G1 */, TFT_G2 /* G2 */, TFT_G3 /* G3 */, TFT_G4 /* G4 */, TFT_G5 /* G5 */,
+    TFT_R0 /* R0 */, TFT_R1 /* R1 */, TFT_R2 /* R2 */, TFT_R3 /* R3 */, TFT_R4 /* R4 */,
+    1 /* hsync_polarity */, 20 /* hsync_front_porch */, 2 /* hsync_pulse_width */, 0 /* hsync_back_porch */,
+    1 /* vsync_polarity */, 30 /* vsync_front_porch */, 8 /* vsync_pulse_width */, 1 /* vsync_back_porch */,
+    10 /* pclk_active_neg */, 6000000L /* prefer_speed */, false /* useBigEndian */,
+    0 /* de_idle_high*/, 0 /* pclk_idle_high */);
+Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
+    TFT_WIDTH /* width */, TFT_HEIGHT /* height */, rgbpanel, 2 /* rotation */, true /* auto_flush */,
+    bus, -1 /* RST */, st7701_type9_init_operations, sizeof(st7701_type9_init_operations));
 
 // Web server
 DNSServer dnsServer;
@@ -59,16 +71,6 @@ unsigned long next_update;
 std::list<flight_info> flights;
 // Flight to display
 std::list<flight_info>::const_iterator it = flights.cbegin();
-
-// GPS variables
-Adafruit_GPS GPS(&Wire);
-unsigned long last_gps_update = 0;
-const unsigned long GPS_UPDATE_INTERVAL = 60000; // Update every minute
-bool gps_connected = false;
-bool gps_fix = false;
-float gps_latitude = 0.0;
-float gps_longitude = 0.0;
-String gps_time = "";
 
 void send_content_gzip(const unsigned char *content, size_t length, const char *mime_type)
 {
@@ -97,73 +99,12 @@ String get_localtime(const char *format)
   return time_buffer;
 }
 
-void update_gps_data()
-{
-  unsigned long current_time = millis();
-  
-  // Check if it's time to update GPS data
-  if (current_time - last_gps_update >= GPS_UPDATE_INTERVAL) {
-    log_i("Updating GPS data...");
-    
-    // Read GPS data
-    GPS.read();
-    
-    // Check if we have a fix
-    if (GPS.fix) {
-      gps_fix = true;
-      gps_latitude = GPS.latitudeDegrees;
-      gps_longitude = GPS.longitudeDegrees;
-      
-      // Format GPS time
-      char time_buffer[32];
-      snprintf(time_buffer, sizeof(time_buffer), "%02d:%02d:%02d", 
-               GPS.hour, GPS.minute, GPS.seconds);
-      gps_time = String(time_buffer);
-      
-      log_i("GPS Fix: Lat=%.6f, Lon=%.6f, Time=%s", 
-            gps_latitude, gps_longitude, gps_time.c_str());
-      
-      // Update location settings with GPS data if this is the first fix
-      static bool first_gps_fix = true;
-      if (first_gps_fix) {
-        log_i("First GPS fix - updating location settings");
-        // Note: In a real implementation, you might want to save these to EEPROM
-        // For now, we'll just log the values
-        log_i("GPS Location: Lat=%.6f, Lon=%.6f", gps_latitude, gps_longitude);
-        first_gps_fix = false;
-      }
-    } else {
-      gps_fix = false;
-      log_w("No GPS fix available");
-    }
-    
-    last_gps_update = current_time;
-  }
-  
-  // Also read GPS data continuously for better responsiveness
-  if (GPS.newNMEAreceived()) {
-    GPS.parse(GPS.lastNMEA());
-  }
-}
 
-// Function to get current location (GPS if available, otherwise user-configured)
-void get_current_location(float &latitude, float &longitude, bool &is_gps_source)
+// Function to get current location (user-configured)
+void get_current_location(float &latitude, float &longitude)
 {
-  if (gps_connected && gps_fix) {
-    latitude = gps_latitude;
-    longitude = gps_longitude;
-    is_gps_source = true;
-    log_d("Using GPS location: Lat=%.6f, Lon=%.6f", latitude, longitude);
-  } else {
     latitude = iotWebParamLatitude.value();
     longitude = iotWebParamLongitude.value();
-    is_gps_source = false;
-    if (!gps_connected) {
-      log_d("GPS not connected, using user-configured location: Lat=%.6f, Lon=%.6f", latitude, longitude);
-    } else {
-      log_d("No GPS fix, using user-configured location: Lat=%.6f, Lon=%.6f", latitude, longitude);
-    }
-  }
 }
 
 void update_runtime_config()
@@ -226,19 +167,10 @@ void handleRoot()
       {"FreeHeap", format_memory(ESP.getFreeHeap())},
       {"MaxAllocHeap", format_memory(ESP.getMaxAllocHeap())},
       {"LocalTime", get_localtime("%F - %T")},
-      // GPS Data
-      {"GpsConnected", gps_connected ? "Yes" : "No"},
-      {"GpsFix", gps_fix ? "Yes" : "No"},
-      {"GpsTime", gps_fix ? gps_time : "No GPS"},
-      {"GpsLatitude", gps_fix ? String(gps_latitude, 6) : "N/A"},
-      {"GpsLongitude", gps_fix ? String(gps_longitude, 6) : "N/A"},
-      {"GpsSatellites", gps_fix ? String(GPS.satellites) : "N/A"},
-      {"GpsLocation", gps_fix ? format_gps_location(gps_latitude, gps_longitude) : "No GPS Fix"},
-      // Current Location Source
-      {"LocationSource", (gps_connected && gps_fix) ? "GPS Active" : "User Configuration"},
-      {"CurrentLatitude", (gps_connected && gps_fix) ? String(gps_latitude, 6) : String(iotWebParamLatitude.value(), 6)},
-      {"CurrentLongitude", (gps_connected && gps_fix) ? String(gps_longitude, 6) : String(iotWebParamLongitude.value(), 6)},
-      {"CurrentLocation", (gps_connected && gps_fix) ? format_gps_location(gps_latitude, gps_longitude) : format_gps_location(iotWebParamLatitude.value(), iotWebParamLongitude.value())},
+      {"Location", iotWebParamLocation.value()},
+      {"Lat", String(iotWebParamLatitude.value())},
+      {"Lon", String(iotWebParamLongitude.value())},
+      {"LatLon", html_location},
       // Network
       {"HostName", hostname},
       {"MacAddress", WiFi.macAddress()},
@@ -268,15 +200,18 @@ void handleRoot()
   server.send(200, "text/html", html);
 }
 
-// Display flushing
-void tft_espi_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p)
+// Display flushing for Arduino_RGB_Display
+void gfx_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p)
 {
   auto w = (area->x2 - area->x1 + 1);
   auto h = (area->y2 - area->y1 + 1);
-  tft.startWrite();
-  tft.setAddrWindow(area->x1, area->y1, w, h);
-  tft.pushColors((uint16_t *)&color_p->full, w * h, true);
-  tft.endWrite();
+
+#if (LV_COLOR_16_SWAP != 0)
+  gfx->draw16bitBeRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
+#else
+  gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
+#endif
+
   lv_disp_flush_ready(drv);
 }
 
@@ -318,46 +253,43 @@ void setup()
   log_i("Free heap: %d bytes", ESP.getFreeHeap());
   log_i("Starting " APP_TITLE "...");
 
-  // Initialize I2C for GPS
-  Wire.begin(43, 44); // SDA=43, SCL=44
-  Wire.setClock(400000); // 400kHz I2C clock
-  
-  // Initialize GPS
-  if (GPS.begin(0x10)) { // PA1010D I2C address
-    GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
-    GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
-    GPS.sendCommand(PMTK_API_SET_FIX_CTL_1HZ);
-    gps_connected = true;
-    log_i("GPS module initialized on I2C pins 43, 44");
-  } else {
-    gps_connected = false;
-    log_e("Failed to initialize GPS module on I2C address 0x10");
-  }
+  Wire.begin(IIC_SDA, IIC_SCL);
+
+  log_e("Moving on to buttons");
 
   // Input buttons
   pinMode(GPIO_BUTTON_TOP, INPUT_PULLUP);
   pinMode(GPIO_BUTTON_BOTTOM, INPUT_PULLUP);
 
+  log_e("Moving on to display initialization");
+
+  // Initialize display (already done at global scope)
+  gfx->begin();
+  gfx->fillScreen(WHITE);
+
+  gfx->setCursor(180, 200);
+  gfx->setTextSize(4);
+  gfx->setTextColor(PINK);
+  gfx->printf("Ciallo");
+
   // Start LVGL
   log_i("LVGL version: %d.%d.%d ", lv_version_major(), lv_version_minor(), lv_version_patch());
   lv_init();
-  tft.begin();
-  // Rotate 90 degrees to Landscape
-  tft.setRotation(1);
-  // Width and height are flipped because is rotated 90 degrees
-  const uint16_t screen_width = TFT_HEIGHT;
-  const uint16_t screen_height = TFT_WIDTH;
+  
+  // Use the actual display dimensions
+  const uint16_t screen_width = TFT_WIDTH;
+  const uint16_t screen_height = TFT_HEIGHT;
 
   static lv_disp_draw_buf_t draw_buf;
-  static lv_color_t buf[screen_width * 10];
-  lv_disp_draw_buf_init(&draw_buf, buf, NULL, screen_width * 10);
+  static lv_color_t buf[screen_width * 20];
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, screen_width * 20);
 
   // Initialize the display
   static lv_disp_drv_t disp_drv;
   lv_disp_drv_init(&disp_drv);
   disp_drv.hor_res = screen_width;
   disp_drv.ver_res = screen_height;
-  disp_drv.flush_cb = tft_espi_flush;
+  disp_drv.flush_cb = gfx_flush;
   disp_drv.draw_buf = &draw_buf;
   lv_disp_drv_register(&disp_drv);
   // Initialize the keyboard
@@ -434,13 +366,13 @@ void display_flight(std::list<flight_info>::const_iterator it)
   if (airline == nullptr)
     log_w("Airline (%s) not found", flight_info.icao_airline.c_str());
 
-  // LINE 1
+  // LINE 1 - Flight info at top
 
   // Flight
   auto label_flight = lv_label_create(lv_scr_act());
   lv_label_set_text(label_flight, flight_info.flight.c_str());
   lv_obj_set_style_text_font(label_flight, &lv_font_montserrat_22, LV_STATE_DEFAULT);
-  lv_obj_align(label_flight, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_align(label_flight, LV_ALIGN_TOP_LEFT, 20, 20);
   // Special color if squawk is special code
   if (flight_info.squawk_hijack() || flight_info.squawk_radio_failure() || flight_info.squawk_emergency())
     lv_obj_set_style_text_color(label_flight, lv_palette_main(LV_PALETTE_RED), LV_STATE_DEFAULT);
@@ -450,22 +382,22 @@ void display_flight(std::list<flight_info>::const_iterator it)
   auto label_from_to = lv_label_create(lv_scr_act());
   lv_label_set_text(label_from_to, from_to.c_str());
   lv_obj_set_style_text_font(label_from_to, &lv_font_montserrat_22, LV_STATE_DEFAULT);
-  lv_obj_align(label_from_to, LV_ALIGN_TOP_LEFT, 90, 0);
+  lv_obj_align(label_from_to, LV_ALIGN_TOP_LEFT, 200, 20);
 
   auto index = std::distance(flights.cbegin(), it) + 1;
   auto total = flights.size();
   auto index_total = String(index) + "/" + String(total);
   auto label_index_total = lv_label_create(lv_scr_act());
   lv_label_set_text(label_index_total, index_total.c_str());
-  lv_obj_align(label_index_total, LV_ALIGN_TOP_RIGHT, 0, 0);
+  lv_obj_align(label_index_total, LV_ALIGN_TOP_RIGHT, -20, 20);
 
-  // LINE 2
+  // LINE 2 - Altitude, Vertical Speed, Ground Speed
 
   //  Altitude
   auto altitude = iotWebParamMetric.value() ? String(flight_info.altitude_metric()) + "m" : String(flight_info.altitude) + "ft";
   auto label_altitude = lv_label_create(lv_scr_act());
   lv_label_set_text(label_altitude, altitude.c_str());
-  lv_obj_align(label_altitude, LV_ALIGN_TOP_LEFT, 0, 24);
+  lv_obj_align(label_altitude, LV_ALIGN_TOP_LEFT, 20, 60);
   if (flight_info.altitude < 0)
     lv_obj_set_style_text_color(label_altitude, lv_palette_main(LV_PALETTE_RED), LV_STATE_DEFAULT);
 
@@ -473,7 +405,7 @@ void display_flight(std::list<flight_info>::const_iterator it)
   auto vertical_speed = iotWebParamMetric.value() ? String(flight_info.vertical_speed_metric()) + "m/m" : String(flight_info.vertical_speed) + "ft/m";
   auto label_vertical_speed = lv_label_create(lv_scr_act());
   lv_label_set_text(label_vertical_speed, vertical_speed.c_str());
-  lv_obj_align(label_vertical_speed, LV_ALIGN_TOP_MID, 0, 24);
+  lv_obj_align(label_vertical_speed, LV_ALIGN_TOP_MID, 0, 60);
   if (flight_info.vertical_speed > 0)
     lv_obj_set_style_text_color(label_vertical_speed, lv_palette_main(LV_PALETTE_GREEN), LV_STATE_DEFAULT);
   else if (flight_info.vertical_speed < 0)
@@ -483,38 +415,38 @@ void display_flight(std::list<flight_info>::const_iterator it)
   auto speed = iotWebParamMetric.value() ? String(flight_info.ground_speed_metric()) + "km/h" : String(flight_info.ground_speed) + "kts";
   auto label_speed = lv_label_create(lv_scr_act());
   lv_label_set_text(label_speed, speed.c_str());
-  lv_obj_align(label_speed, LV_ALIGN_TOP_RIGHT, 0, 24);
+  lv_obj_align(label_speed, LV_ALIGN_TOP_RIGHT, -20, 60);
 
-  // LINE 3
+  // LINE 3 - Registration and Aircraft
 
   // Registration
   auto label_registration = lv_label_create(lv_scr_act());
   lv_label_set_text(label_registration, flight_info.registration.c_str());
-  lv_obj_align(label_registration, LV_ALIGN_TOP_LEFT, 0, 40);
+  lv_obj_align(label_registration, LV_ALIGN_TOP_LEFT, 20, 100);
 
   // Aircraft
   auto aircraft_type = aircraft ? String(aircraft->manufacturer) + " " + String(aircraft->type) : flight_info.aircraft_code;
   auto label_aircraft_type = lv_label_create(lv_scr_act());
   lv_label_set_text(label_aircraft_type, aircraft_type.c_str());
-  lv_obj_set_width(label_aircraft_type, 240 - 70);
+  lv_obj_set_width(label_aircraft_type, 480 - 140);
   lv_label_set_long_mode(label_aircraft_type, LV_LABEL_LONG_SCROLL_CIRCULAR);
-  lv_obj_align(label_aircraft_type, LV_ALIGN_TOP_LEFT, 70, 40);
+  lv_obj_align(label_aircraft_type, LV_ALIGN_TOP_LEFT, 140, 100);
 
-  // LINE 4 - 56
+  // LINE 4 - Lat Lon and Heading
 
   // Lat Lon
   auto latlon = format_gps_location(flight_info.latitude, flight_info.longitude);
   auto label_latlon = lv_label_create(lv_scr_act());
   lv_label_set_text(label_latlon, latlon.c_str());
-  lv_obj_align(label_latlon, LV_ALIGN_TOP_LEFT, 0, 56);
+  lv_obj_align(label_latlon, LV_ALIGN_TOP_LEFT, 20, 140);
 
   // Heading \u00b0 = degrees
   auto heading = format_zero_padding(flight_info.heading, 3) + "\u00b0";
   auto label_heading = lv_label_create(lv_scr_act());
   lv_label_set_text(label_heading, heading.c_str());
-  lv_obj_align(label_heading, LV_ALIGN_TOP_RIGHT, -45, 56);
+  lv_obj_align(label_heading, LV_ALIGN_TOP_RIGHT, -20, 140);
 
-  // LINE 5 - 72
+  // LINE 5 - Airline
 
   if (airline)
   {
@@ -522,21 +454,21 @@ void display_flight(std::list<flight_info>::const_iterator it)
 
     auto label_airline = lv_label_create(lv_scr_act());
     lv_label_set_text(label_airline, airline->name);
-    lv_obj_set_width(label_airline, 240 - 45);
+    lv_obj_set_width(label_airline, 480 - 90);
     lv_label_set_long_mode(label_airline, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(label_airline, LV_ALIGN_TOP_LEFT, 0, 56 + 40 - 14);
+    lv_obj_align(label_airline, LV_ALIGN_TOP_LEFT, 20, 180);
 
     if (airline->logo.data)
     {
       auto image = lv_gif_create(lv_scr_act());
       lv_gif_set_src(image, &airline->logo);
-      lv_obj_align(image, LV_ALIGN_TOP_RIGHT, 0, 56);
+      lv_obj_align(image, LV_ALIGN_TOP_RIGHT, -20, 180);
     }
     else
       log_w("No logo present for airline: %s", airline->icao_airline);
   }
 
-  // BOTTOM
+  // BOTTOM - Origin and Destination
 
   auto iata_origin = flight_info.origin_airport();
   if (iata_origin)
@@ -548,15 +480,15 @@ void display_flight(std::list<flight_info>::const_iterator it)
       {
         auto image = lv_gif_create(lv_scr_act());
         lv_gif_set_src(image, &iata_origin->country->flag);
-        lv_obj_align(image, LV_ALIGN_BOTTOM_LEFT, 0, -20);
+        lv_obj_align(image, LV_ALIGN_BOTTOM_LEFT, 20, -60);
       }
     }
 
     auto label_origin = lv_label_create(lv_scr_act());
     lv_label_set_text(label_origin, iata_origin->name);
-    lv_obj_set_width(label_origin, 240 - 26);
+    lv_obj_set_width(label_origin, 480 - 52);
     lv_label_set_long_mode(label_origin, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(label_origin, LV_ALIGN_BOTTOM_LEFT, 26, -20);
+    lv_obj_align(label_origin, LV_ALIGN_BOTTOM_LEFT, 52, -60);
   }
   else
     log_w("From airport (%s) not found", flight_info.iata_origin_airport.c_str());
@@ -571,15 +503,15 @@ void display_flight(std::list<flight_info>::const_iterator it)
       {
         auto image = lv_gif_create(lv_scr_act());
         lv_gif_set_src(image, &iata_destination->country->flag);
-        lv_obj_align(image, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+        lv_obj_align(image, LV_ALIGN_BOTTOM_LEFT, 20, -20);
       }
     }
 
     auto label_destination = lv_label_create(lv_scr_act());
     lv_label_set_text(label_destination, iata_destination->name);
-    lv_obj_set_width(label_destination, 240 - 26);
+    lv_obj_set_width(label_destination, 480 - 52);
     lv_label_set_long_mode(label_destination, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(label_destination, LV_ALIGN_BOTTOM_LEFT, 26, 0);
+    lv_obj_align(label_destination, LV_ALIGN_BOTTOM_LEFT, 52, -20);
   }
   else
     log_w("To airport (%s) not found", flight_info.iata_destination_airport.c_str());
@@ -630,7 +562,7 @@ void display_network_state(iotwebconf::NetworkState state)
     auto timeout = atoi(iotWebConf.getApTimeoutParameter()->valueBuffer);
     log_i("Timeout: %d seconds", timeout);
     auto bar = lv_bar_create(lv_scr_act());
-    lv_obj_set_size(bar, 240, 3);
+    lv_obj_set_size(bar, 480, 6);
     lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_bar_set_range(bar, 0, 100);
 
@@ -676,10 +608,9 @@ void display_flights()
     {
       log_i("Updating flights");
       
-      // Get current location (GPS or user-configured)
+      // Get current location (user-configured)
       float current_lat, current_lon;
-      bool using_gps;
-      get_current_location(current_lat, current_lon, using_gps);
+      get_current_location(current_lat, current_lon);
       
       String error_message;
       if (!get_flights(current_lat, current_lon, iotWebParamLatitudeRange.value(), iotWebParamLongitudeRange.value(), iotWebParamAirborne.value(), iotWebParamGrounded.value(), iotWebParamGliders.value(), iotWebParamVehicles.value(), flights, error_message))
@@ -706,55 +637,34 @@ void display_flights()
         
         // Get current location for display
         float display_lat, display_lon;
-        bool using_gps_for_display;
-        get_current_location(display_lat, display_lon, using_gps_for_display);
+        get_current_location(display_lat, display_lon);
         
         // Display current time
         auto label_time = lv_label_create(lv_scr_act());
         lv_label_set_text(label_time, get_localtime("%F - %R").c_str());
-        lv_obj_align(label_time, LV_ALIGN_CENTER, 0, -20);
+        lv_obj_align(label_time, LV_ALIGN_CENTER, 0, -40);
         
         // Display current location
         auto label_latlon = lv_label_create(lv_scr_act());
         lv_label_set_text(label_latlon, format_gps_location(display_lat, display_lon).c_str());
         lv_obj_align(label_latlon, LV_ALIGN_CENTER, 0, 0);
         
+        // Display IP Address
+        auto ip_address = WiFi.localIP().toString();
+        auto label_ip = lv_label_create(lv_scr_act());
+        lv_label_set_text(label_ip, ip_address.c_str());
+        lv_obj_set_style_text_color(label_ip, lv_palette_main(LV_PALETTE_BLUE), LV_STATE_DEFAULT);
+        lv_obj_align(label_ip, LV_ALIGN_CENTER, 0, 20);
+        
         // Display location source
         auto label_source = lv_label_create(lv_scr_act());
-        if (using_gps_for_display) {
-          lv_label_set_text(label_source, "GPS Active");
-          lv_obj_set_style_text_color(label_source, lv_palette_main(LV_PALETTE_GREEN), LV_STATE_DEFAULT);
-          
-          // Show GPS time and satellite count
-          auto label_gps_time = lv_label_create(lv_scr_act());
-          lv_label_set_text(label_gps_time, ("GPS: " + gps_time).c_str());
-          lv_obj_align(label_gps_time, LV_ALIGN_CENTER, 0, 20);
-          
-          if (GPS.satellites > 0) {
-            auto label_satellites = lv_label_create(lv_scr_act());
-            lv_label_set_text(label_satellites, ("Sats: " + String(GPS.satellites)).c_str());
-            lv_obj_align(label_satellites, LV_ALIGN_CENTER, 0, 40);
-          }
-        } else {
-          lv_label_set_text(label_source, "User Config");
-          lv_obj_set_style_text_color(label_source, lv_palette_main(LV_PALETTE_BLUE), LV_STATE_DEFAULT);
-          
-          // Show GPS status based on connection and fix
-          auto label_gps_status = lv_label_create(lv_scr_act());
-          if (!gps_connected) {
-            lv_label_set_text(label_gps_status, "GPS: Not Connected");
-            lv_obj_set_style_text_color(label_gps_status, lv_palette_main(LV_PALETTE_RED), LV_STATE_DEFAULT);
-          } else {
-            lv_label_set_text(label_gps_status, "GPS: No Fix");
-            lv_obj_set_style_text_color(label_gps_status, lv_palette_main(LV_PALETTE_ORANGE), LV_STATE_DEFAULT);
-          }
-          lv_obj_align(label_gps_status, LV_ALIGN_CENTER, 0, 20);
-        }
-        lv_obj_align(label_source, LV_ALIGN_CENTER, 0, -40);
+        lv_label_set_text(label_source, "User Config");
+        lv_obj_set_style_text_color(label_source, lv_palette_main(LV_PALETTE_BLUE), LV_STATE_DEFAULT);
+        lv_obj_align(label_source, LV_ALIGN_CENTER, 0, -80);
         
         auto label_location = lv_label_create(lv_scr_act());
         lv_label_set_text(label_location, iotWebParamLocation.value());
-        lv_obj_align(label_location, LV_ALIGN_BOTTOM_MID, 0, -16);
+        lv_obj_align(label_location, LV_ALIGN_BOTTOM_MID, 0, -32);
         auto label_timezone = lv_label_create(lv_scr_act());
         lv_label_set_text(label_timezone, iotWebParamTimeZone.value());
         lv_obj_align(label_timezone, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -780,8 +690,7 @@ void loop()
   // Web configuration
   iotWebConf.doLoop();
 
-  // Update GPS data every minute
-  update_gps_data();
+
 
   static auto last_network_state = iotwebconf::NetworkState::Boot;
 
