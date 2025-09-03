@@ -89,5 +89,3 @@ const lv_img_dsc_t image_splash = {
     .h = 135},
   .data_size = sizeof(image_splash_map),
   .data = image_splash_map};
-
-
